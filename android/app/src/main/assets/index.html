@@ -160,7 +160,7 @@ a.sbtn{text-decoration:none;display:inline-block}
    - "assets" : images stockées sur l'appareil (IndexedDB) */
 (function(){
   const PEER_PREFIX="animedraftduel-v1-";
-  const PEERJS_URLS=["https://x.invalid/peerjs/1.5.4/peerjs.min.js","https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js","https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"];
+  const PEERJS_URLS=["https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.4/peerjs.min.js","https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js","https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"];
   let peerLib=null;
   function loadPeerJS(){
     if(peerLib)return peerLib;
@@ -255,6 +255,51 @@ a.sbtn{text-decoration:none;display:inline-block}
     });
   }
 
+
+  /* ---------- sauvegarde des images : un seul fichier .addpack ---------- */
+  const MAGIC="ADDPACK1";
+  function b64(bytes){let s="";for(let i=0;i<bytes.length;i+=0x8000)s+=String.fromCharCode.apply(null,bytes.subarray(i,i+0x8000));return btoa(s)}
+  async function androidSave(file,name){
+    if(!window.AndroidSave.begin(name))throw new Error("Impossible de préparer le fichier.");
+    const step=393216;
+    for(let o=0;o<file.size;o+=step){const part=new Uint8Array(await file.slice(o,o+step).arrayBuffer());window.AndroidSave.append(b64(part))}
+    window.AndroidSave.finish();
+  }
+  window.__pack={
+    async save(artMap,creditMap){
+      const items=[],parts=[];
+      for(const [slug,id] of Object.entries(artMap||{})){
+        let blob=null;try{blob=await tx("readonly",s=>s.get(id))}catch(e){}
+        if(!blob)continue;
+        items.push({slug,type:blob.type||"image/png",size:blob.size});parts.push(blob);
+      }
+      const enc=new TextEncoder();
+      const header=enc.encode(JSON.stringify({format:"anime-draft-duel-images",version:1,credits:creditMap||{},items}));
+      const len=new Uint8Array(4);new DataView(len.buffer).setUint32(0,header.length);
+      const file=new Blob([enc.encode(MAGIC),len,header,...parts],{type:"application/octet-stream"});
+      const name="anime-draft-duel-images.addpack";
+      if(window.AndroidSave){await androidSave(file,name);return{count:items.length,name,note:"Choisis où l'enregistrer dans la fenêtre qui s'ouvre."}}
+      const url=URL.createObjectURL(file),a=document.createElement("a");
+      a.href=url;a.download=name;document.body.appendChild(a);a.click();a.remove();
+      setTimeout(()=>URL.revokeObjectURL(url),120000);
+      return{count:items.length,name};
+    },
+    async read(file){
+      const buf=await file.arrayBuffer(),u=new Uint8Array(buf),dec=new TextDecoder();
+      if(buf.byteLength<12||dec.decode(u.subarray(0,8))!==MAGIC)throw new Error("format");
+      const len=new DataView(buf).getUint32(8);
+      const h=JSON.parse(dec.decode(u.subarray(12,12+len)));
+      if(!h||h.format!=="anime-draft-duel-images"||!Array.isArray(h.items))throw new Error("format");
+      let off=12+len;const items=[];
+      for(const it of h.items){
+        const size=Math.max(0,it&&it.size|0);
+        if(off+size>buf.byteLength)throw new Error("tronqué");
+        if(it&&typeof it.slug==="string"&&/^image\/[a-z0-9.+-]+$/i.test(it.type))items.push({slug:it.slug,blob:new Blob([u.slice(off,off+size)],{type:it.type})});
+        off+=size;
+      }
+      return{items,credits:h.credits&&typeof h.credits==="object"?h.credits:{}};
+    }
+  };
   let roomP=null,dbP=null,assetsP=null;
   window.claude={use(name){
     if(name==="room")return roomP||(roomP=Promise.resolve(makeRoom()));
@@ -621,6 +666,48 @@ function viewHome(){
   ${assets&&artDoc?`<button class="btn ghost" id="gallery">Artworks des personnages (${C.filter((_,i)=>artOf(i)).length}/${C.length})</button>`:""}
   <p class="note" style="text-align:center">${C.length} personnages · notes sur 1000</p>`;
 }
+
+/* ---------- sauvegarde des images (appli PC / Android uniquement) ---------- */
+let packMsg="", packBusy=false;
+async function exportPack(){
+  if(!window.__pack||!assets||packBusy)return;
+  const n=C.filter((_,i)=>artOf(i)).length;
+  if(!n){packMsg="Aucune image à sauvegarder pour l'instant.";return render()}
+  packBusy=true;packMsg="Préparation de la sauvegarde ("+n+" images)…";render();
+  try{const r=await window.__pack.save(artMap,creditMap);packMsg=r.count+" image(s) sauvegardée(s) dans « "+r.name+" »."+(r.note?" "+r.note:"")}
+  catch(e){packMsg="La sauvegarde a échoué. "+(e&&e.message?e.message:"Réessaie.")}
+  packBusy=false;render();
+}
+async function importPack(file){
+  if(!window.__pack||!assets||!artDoc||packBusy||!file)return;
+  packBusy=true;packMsg="Lecture du fichier…";render();
+  try{
+    const pack=await window.__pack.read(file);
+    const known=new Set(C.map(c=>slug(c[0])));
+    let m={...artMap},ok=0,skip=0,done=0;const old=[];
+    for(const e of pack.items){
+      done++;
+      if(!known.has(e.slug)){skip++;continue}
+      const r=await assets.upload(e.blob);
+      if(m[e.slug]&&m[e.slug]!==r.id)old.push(m[e.slug]);
+      m={...m,[e.slug]:r.id};ok++;
+      if(done%10===0){packMsg="Import… "+done+" / "+pack.items.length;render()}
+    }
+    artMap=m;await artDoc.set(m);
+    for(const id of old)assets.delete(id).catch(()=>{});
+    const cr={...creditMap};for(const k in pack.credits||{})if(known.has(k)&&typeof pack.credits[k]==="string")cr[k]=pack.credits[k].slice(0,60);
+    if(creditDoc){creditMap=cr;await creditDoc.set(cr)}
+    packMsg=ok+" image(s) importée(s)"+(skip?" · "+skip+" ignorée(s) (perso absent du jeu)":"")+".";
+  }catch(e){packMsg="Ce fichier n'est pas une sauvegarde d'images Anime Draft Duel valide."}
+  packBusy=false;render();
+}
+function viewPack(){
+  return `<div class="panel"><div class="label">Sauvegarde des images</div>
+  <p class="note">Exporte toutes tes images (et leurs crédits) dans un seul fichier, puis importe-le sur un autre appareil, par exemple du PC vers le téléphone. Les images importées remplacent celles des mêmes persos.</p>
+  ${packMsg?`<div class="banner">${esc(packMsg)}</div>`:""}
+  <div class="row"><button class="btn gold" id="packexport" ${packBusy?"disabled":""}>Exporter mes images</button><label class="btn ghost" for="packimport" style="text-align:center">Importer une sauvegarde</label></div>
+  <input type="file" id="packimport" accept=".addpack,application/octet-stream" hidden></div>`;
+}
 function viewGallery(){
   const q=(document.getElementById("gsearch")?.value||"").trim().toLowerCase();
   const list=C.map((c,i)=>i).filter(i=>(!q||(C[i][0]+" "+C[i][1]).toLowerCase().includes(q))&&(!onlyMissing||!artOf(i)));
@@ -635,6 +722,7 @@ function viewGallery(){
   <div class="row"><label class="btn gold" for="bulk" style="text-align:center">Importer des images</label><label class="btn ghost" for="bulkdir" style="text-align:center">Importer un dossier</label></div>
   <input type="file" id="bulk" accept="image/*" multiple hidden><input type="file" id="bulkdir" webkitdirectory multiple hidden></div>
   ${viewImport()}
+  ${window.__pack?viewPack():""}
   ${viewChain()}
   ${galMsg?`<div class="banner">${esc(galMsg)}</div>`:""}
   <div class="gal">${list.map(i=>{const c=C[i],a=artOf(i),k=slug(c[0]),h=hue(c[1]);
@@ -712,7 +800,7 @@ function render(){
   for(const id in vals){const el=document.getElementById(id);if(el)el.value=vals[id]}
   if(focus){const el=document.getElementById(focus);if(el){el.focus();if(el.tagName==="INPUT"&&el.type!=="file"){try{el.setSelectionRange(el.value.length,el.value.length)}catch(e){}}}}
 }
-document.addEventListener("change",e=>{if((e.target.id==="bulk"||e.target.id==="bulkdir")&&e.target.files&&e.target.files.length)return bulkImport(e.target.files);const c=e.target.dataset&&e.target.dataset.cr;if(c!==undefined)return saveCredit(+c,e.target.value);const i=e.target.dataset&&e.target.dataset.art;if(i!==undefined&&e.target.files&&e.target.files[0])uploadArt(+i,e.target.files[0])});
+document.addEventListener("change",e=>{if(e.target.id==="packimport"&&e.target.files&&e.target.files[0]){const f=e.target.files[0];e.target.value="";return importPack(f)}if((e.target.id==="bulk"||e.target.id==="bulkdir")&&e.target.files&&e.target.files.length)return bulkImport(e.target.files);const c=e.target.dataset&&e.target.dataset.cr;if(c!==undefined)return saveCredit(+c,e.target.value);const i=e.target.dataset&&e.target.dataset.art;if(i!==undefined&&e.target.files&&e.target.files[0])uploadArt(+i,e.target.files[0])});
 document.addEventListener("input",e=>{if(e.target.id==="gsearch"||e.target.id==="ssearch")render()});
 document.addEventListener("change",e=>{if(e.target.id==="sedited")render()});
 document.addEventListener("click",e=>{
@@ -733,7 +821,7 @@ document.addEventListener("click",e=>{
   if(b.id==="resetsearch"){searched=new Set();return render()}
   if(b.dataset.place!==undefined)return place(+b.dataset.place);
   if(b.dataset.rm!==undefined)return removeArt(+b.dataset.rm);
-  const a={gallery:()=>{screen="gallery";galMsg="";render();window.scrollTo(0,0)},home:()=>{screen="home";render()},missing:()=>{onlyMissing=!onlyMissing;render()},closeimport:()=>{importState=null;render()},create:createOnline,join:joinOnline,local:startLocal,start:startOnline,skip,rematch,leave,ready:toggleReady,
+  const a={gallery:()=>{screen="gallery";galMsg="";render();window.scrollTo(0,0)},home:()=>{screen="home";render()},missing:()=>{onlyMissing=!onlyMissing;render()},closeimport:()=>{importState=null;render()},packexport:exportPack,create:createOnline,join:joinOnline,local:startLocal,start:startOnline,skip,rematch,leave,ready:toggleReady,
     fast:()=>{revealN=9;clearInterval(revealTimer);render()},
     copy:()=>{navigator.clipboard?.writeText(me.code).then(()=>{b.textContent="Copié"},()=>{b.textContent=me.code})}}[b.id];
   if(a)a();
