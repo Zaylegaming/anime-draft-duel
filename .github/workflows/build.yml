@@ -1,0 +1,37 @@
+name: Compiler l'APK Android
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Compiler
+        run: gradle -p android assembleDebug --no-daemon
+      - name: Renommer l'APK
+        run: cp android/app/build/outputs/apk/debug/app-debug.apk Anime-Draft-Duel.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Anime-Draft-Duel-apk
+          path: Anime-Draft-Duel.apk
+      - name: Publier dans la page Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: Anime Draft Duel v1.0.${{ github.run_number }}
+          body: "APK Android à installer sur le téléphone. Autorise l'installation depuis des sources inconnues si Android le demande."
+          files: Anime-Draft-Duel.apk
